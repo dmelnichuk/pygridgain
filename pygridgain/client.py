@@ -42,7 +42,8 @@ the local (class-wise) registry for GridGain Complex objects.
 
 from collections import defaultdict, OrderedDict
 import random
-from typing import Dict, Iterable, Optional, Tuple, Type, Union
+import re
+from typing import Dict, Iterable, List, Optional, Tuple, Type, Union
 
 from .api.binary import get_binary_type, put_binary_type
 from .api.cache_config import cache_get_names
@@ -56,7 +57,8 @@ from .exceptions import (
     BinaryTypeError, CacheError, ReconnectError, SQLError, connection_errors,
 )
 from .utils import (
-    entity_id, schema_id, select_version, status_to_exception, is_iterable
+    capitalize, entity_id, schema_id, process_delimiter, select_version,
+    status_to_exception, is_iterable,
 )
 from .binary import GenericObjectMeta
 
@@ -80,10 +82,14 @@ class Client:
     _compact_footer: bool = None
     _connection_args: Dict = None
     _current_node: int = None
-    _nodes: Union[Iterable[Connection], Dict['UUID', Connection]] = None
+    _nodes: List[Connection] = None
 
-    affinity_version: Tuple = None
-    protocol_version = None
+    # used for Complex object data class names sanitizing
+    _identifier = re.compile(r'[^0-9a-zA-Z_.+$]', re.UNICODE)
+    _ident_start = re.compile(r'^[^a-zA-Z_]+', re.UNICODE)
+
+    affinity_version: Optional[Tuple] = None
+    protocol_version: Optional[Tuple] = None
 
     def __init__(
         self, compact_footer: bool = None, affinity_aware: bool = False,
@@ -106,6 +112,7 @@ class Client:
         """
         self._compact_footer = compact_footer
         self._connection_args = kwargs
+        self._nodes = []
         self._current_node = 0
         self._affinity_aware = affinity_aware
         self.affinity_version = (0, 0)
@@ -125,43 +132,6 @@ class Client:
     @property
     def affinity_aware(self):
         return self._affinity_aware
-
-    @select_version
-    def _add_node(
-        self, host: str = None, port: int = None,
-        conn: Connection = None, node_uuid: 'UUID' = None,
-    ) -> 'UUID':
-        """
-        Opens a connection to GridGain server and adds it to the nodes'
-        collection (connection pool).
-        """
-        if self._nodes is None:
-            self._nodes = {}
-
-        if conn is None:
-            conn = Connection(self, **self._connection_args)
-            hs_response = conn.connect(host, port)
-            node_uuid = hs_response['node_uuid']
-
-        if node_uuid:
-            self._nodes[node_uuid] = conn
-        return node_uuid
-
-    def _add_node_130(
-        self, host: str = None, port: int = None, conn: Connection = None,
-        *args, **kwargs,
-    ):
-        if self._nodes is None:
-            self._nodes = []
-
-        if conn is None:
-            conn = Connection(self, **self._connection_args)
-            conn.host = host
-            conn.port = port
-
-        self._nodes.append(conn)
-
-    _add_node_120 = _add_node_130
 
     def connect(self, *args):
         """
@@ -185,35 +155,50 @@ class Client:
         else:
             raise ConnectionError('Connection parameters are not valid.')
 
-        nodes = iter(nodes)
+        # the following code is quite twisted, because the protocol version
+        # is initially unknown
+
         # TODO: open first node in foregroung, others − in background
+        for i, node in enumerate(nodes):
+            host, port = node
+            conn = Connection(self, **self._connection_args)
+            conn.host = host
+            conn.port = port
 
-        first_node = Connection(self, **self._connection_args)
+            try:
+                if (
+                    self.protocol_version is None
+                    or self.protocol_version >= (1, 4, 0)
+                ):
+                    # open connection before adding to the pool
+                    conn.connect(host, port)
 
-        # now we know protocol version
-        self._add_node(
-            conn=first_node,
-            node_uuid=first_node.connect(*next(nodes)).get('node_uuid', None),
-        )
+                    # now we have the protocol version
+                    if self.protocol_version < (1, 4, 0):
+                        # do not try to open more nodes
+                        self._current_node = i
+                    else:
+                        # take a chance to schedule the reconnection
+                        # for all the failed connections, that was probed
+                        # before this
+                        for failed_node in self._nodes[:i]:
+                            failed_node.reconnect()
 
-        for host, port in nodes:
-            self._add_node(host, port)
+            except connection_errors:
+                conn._fail()
+                if (
+                    self.protocol_version
+                    and self.protocol_version >= (1, 4, 0)
+                ):
+                    # schedule the reconnection
+                    conn.reconnect()
 
-    @select_version
+            self._nodes.append(conn)
+
     def close(self):
-        """
-        Close all connections to the server and clean the connection pool.
-        """
-        for conn in self._nodes.values():
-            conn.close()
-        self._nodes.clear()
-
-    def close_130(self):
         for conn in self._nodes:
             conn.close()
         self._nodes.clear()
-
-    close_120 = close_130
 
     @property
     @select_version
@@ -227,7 +212,7 @@ class Client:
         """
         try:
             return random.choice(
-                list(n for n in self._nodes.values() if n.alive)
+                list(n for n in self._nodes if n.alive)
             )
         except IndexError:
             # cannot choose from an empty sequence
@@ -401,10 +386,39 @@ class Client:
             for schema in type_info['schemas']:
                 if not self._registry[type_id].get(schema_id(schema), None):
                     data_class = self._create_dataclass(
-                        type_info['type_name'],
+                        self._create_type_name(type_info['type_name']),
                         schema,
                     )
                     self._registry[type_id][schema_id(schema)] = data_class
+
+    @classmethod
+    def _create_type_name(cls, type_name: str) -> str:
+        """
+        Creates Python data class name from GridGain binary type name.
+
+        Handles all the special cases found in
+        `java.org.apache.ignite.binary.BinaryBasicNameMapper.simpleName()`.
+        Tries to adhere to PEP8 along the way.
+        """
+
+        # general sanitizing
+        type_name = cls._identifier.sub('', type_name)
+
+        # - name ending with '$' (Scala)
+        # - name + '$' + some digits (anonymous class)
+        # - '$$Lambda$' in the middle
+        type_name = process_delimiter(type_name, '$')
+
+        # .NET outer/inner class delimiter
+        type_name = process_delimiter(type_name, '+')
+
+        # Java fully qualified class name
+        type_name = process_delimiter(type_name, '.')
+
+        # start chars sanitizing
+        type_name = capitalize(cls._ident_start.sub('', type_name))
+
+        return type_name
 
     def register_binary_type(
         self, data_class: Type, affinity_key_field: str = None,
